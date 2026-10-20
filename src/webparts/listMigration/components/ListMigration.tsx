@@ -19,6 +19,7 @@ import ListMigrationService, {
   IListMigrationPlan,
   IListMigrationRequest
 } from '../services/ListMigrationService';
+import { getReadableErrorMessage } from '../services/errorHandling';
 
 export default function ListMigration(props: IListMigrationProps): React.ReactElement {
   const currentSiteUrl = props.context.pageContext.web.absoluteUrl;
@@ -30,6 +31,7 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
   const [busy, setBusy] = React.useState(false);
   const [confirmed, setConfirmed] = React.useState(false);
   const [migrationSucceeded, setMigrationSucceeded] = React.useState(false);
+  const [migrationGroupWarnings, setMigrationGroupWarnings] = React.useState<string[]>([]);
   const [verificationReport, setVerificationReport] = React.useState<IListVerificationReport>();
   const [error, setError] = React.useState('');
   const [messages, setMessages] = React.useState<string[]>([]);
@@ -43,6 +45,7 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
     setPlan(undefined);
     setConfirmed(false);
     setMigrationSucceeded(false);
+    setMigrationGroupWarnings([]);
     setVerificationReport(undefined);
     setMessages([]);
   };
@@ -72,7 +75,7 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
       const service = new ListMigrationService(props.context, getRequest());
       setPlan(await service.preflight());
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
+      setError(`Preflight failed:\n${getReadableErrorMessage(failure)}`);
     } finally {
       releaseInFlight();
       setBusy(false);
@@ -88,11 +91,13 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
     setError('');
     try {
       const service = new ListMigrationService(props.context, getRequest());
-      await service.migrate(plan, message => setMessages(previous => [...previous.slice(-29), message]));
+      setMigrationGroupWarnings(
+        await service.migrate(plan, message => setMessages(previous => [...previous.slice(-29), message]))
+      );
       setConfirmed(false);
       setMigrationSucceeded(true);
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
+      setError(`Migration failed:\n${getReadableErrorMessage(failure)}`);
     } finally {
       releaseInFlight();
       setBusy(false);
@@ -109,7 +114,7 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
       const service = new ListMigrationService(props.context, getRequest());
       setVerificationReport(await service.verify(plan));
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
+      setError(`Consistency check failed:\n${getReadableErrorMessage(failure)}`);
     } finally {
       releaseInFlight();
       setBusy(false);
@@ -229,7 +234,11 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
           {busy && <Spinner label="Processing migration" />}
         </Stack>
 
-        {error && <MessageBar messageBarType={MessageBarType.error} role="alert">{error}</MessageBar>}
+        {error && (
+          <MessageBar messageBarType={MessageBarType.error} role="alert" isMultiline>
+            <div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{error}</div>
+          </MessageBar>
+        )}
 
         {plan && <>
           <div className={styles.summary}>
@@ -296,13 +305,25 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
         dialogContentProps={{
           type: DialogType.normal,
           title: 'Migration successful',
-          subText: `All ${plan?.items.length || 0} records and their attachments have been copied successfully.`
+          subText: `${plan?.items.length || 0} records were processed.`
         }}
         modalProps={{ isBlocking: true }}
       >
-        <MessageBar messageBarType={MessageBarType.success} isMultiline>
-          The migration completed successfully. Please verify the records in the destination list.
+        <MessageBar
+          messageBarType={migrationGroupWarnings.length ? MessageBarType.warning : MessageBarType.success}
+          isMultiline
+        >
+          {migrationGroupWarnings.length
+            ? 'Migration completed, but some group/principal values were not copied. Check them separately.'
+            : 'The migration completed successfully. Please verify the records in the destination list.'}
         </MessageBar>
+        {migrationGroupWarnings.length > 0 && (
+          <MessageBar messageBarType={MessageBarType.warning} isMultiline>
+            <ul>
+              {migrationGroupWarnings.map((warning, index) => <li key={`${index}-${warning}`}>{warning}</li>)}
+            </ul>
+          </MessageBar>
+        )}
         <DialogFooter>
           <PrimaryButton
             text="Done"
@@ -327,19 +348,31 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
       >
         <MessageBar
           messageBarType={
-            verificationReport.sourceOnlyRecords === 0 &&
-            verificationReport.targetOnlyRecords === 0
-              ? MessageBarType.success
-              : MessageBarType.warning
+            verificationReport.groupWarnings.length > 0
+              ? MessageBarType.warning
+              : verificationReport.sourceOnlyRecords === 0 && verificationReport.targetOnlyRecords === 0
+                ? MessageBarType.success
+                : MessageBarType.warning
           }
           isMultiline
         >
-          {verificationReport.sourceOnlyRecords === 0 && verificationReport.targetOnlyRecords === 0
+          {verificationReport.groupWarnings.length > 0
+            ? 'The comparable values were checked, but unresolved group/principal values were excluded.'
+            : verificationReport.sourceOnlyRecords === 0 && verificationReport.targetOnlyRecords === 0
             ? 'Both lists contain the same values for all participating migration fields, including duplicate counts.'
             : 'The lists differ in the participating migration field values.'}
           {' '}Source-only records: {verificationReport.sourceOnlyRecords};
           {' '}destination-only records: {verificationReport.targetOnlyRecords}.
         </MessageBar>
+        {verificationReport.groupWarnings.length > 0 && (
+          <MessageBar messageBarType={MessageBarType.warning} isMultiline>
+            <strong>Some group/principal values could not be resolved and were excluded from this comparison.
+              Check these values separately:</strong>
+            <ul>
+              {verificationReport.groupWarnings.map((warning, index) => <li key={`${index}-${warning}`}>{warning}</li>)}
+            </ul>
+          </MessageBar>
+        )}
         {verificationReport.differences.length > 0 && (
           <div className={styles.tableWrap}>
             <table className={styles.fieldTable} aria-label="Consistency differences">

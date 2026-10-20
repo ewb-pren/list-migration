@@ -2,6 +2,7 @@ import { spfi, SPFx } from '@pnp/sp';
 import { WebPartContext } from '@microsoft/sp-webpart-base';
 import { PermissionKind } from '@pnp/sp/security';
 import { compareRecords } from './ListComparison';
+import { getReadableErrorMessage } from './errorHandling';
 import '@pnp/sp/webs';
 import '@pnp/sp/lists';
 import '@pnp/sp/items';
@@ -9,6 +10,7 @@ import '@pnp/sp/fields';
 import '@pnp/sp/attachments';
 import '@pnp/sp/files';
 import '@pnp/sp/site-users/web';
+import '@pnp/sp/site-groups/web';
 import '@pnp/sp/security/list';
 
 export interface IListMigrationRequest {
@@ -56,6 +58,7 @@ export interface IListVerificationReport {
   sourceOnlyRecords: number;
   targetOnlyRecords: number;
   differences: IListVerificationDifference[];
+  groupWarnings: string[];
 }
 
 interface IMigrationCheckpointEntry {
@@ -155,6 +158,32 @@ function getCopyValues(item: IListMigrationItem, fields: IListMigrationField[]):
   return values;
 }
 
+function fieldAllowsGroups(field: IListMigrationField): boolean {
+  const schema = new DOMParser().parseFromString(field.SchemaXml, 'application/xml');
+  if (schema.querySelector('parsererror')) {
+    return false;
+  }
+  const mode = (schema.documentElement.getAttribute('UserSelectionMode') || '').toLowerCase();
+  return mode === 'peopleandgroups' || mode === '1';
+}
+
+function isNotFoundError(error: unknown): boolean {
+  const message = getReadableErrorMessage(error);
+  return /HTTP 404\b/i.test(message) || /cannot be found/i.test(message);
+}
+
+function isGroupPrincipal(principalType: unknown): boolean {
+  return typeof principalType === 'number' && principalType > 0 && (principalType & 1) === 0;
+}
+
+interface IResolvedPrincipal {
+  kind: 'user' | 'group';
+  identity: string;
+  title: string;
+}
+
+class PrincipalNotFoundError extends Error {}
+
 function normalizeValue(value: unknown): string {
   if (value === null || value === undefined) {
     return 'null';
@@ -177,7 +206,7 @@ export default class ListMigrationService {
   private source;
   private target;
   private userIds: Record<string, number> = {};
-  private readonly userIdentityCache: Record<string, Promise<string>> = {};
+  private readonly principalCache: Record<string, Promise<IResolvedPrincipal>> = {};
   private running = false;
   private readonly request: IListMigrationRequest;
 
@@ -216,6 +245,18 @@ export default class ListMigrationService {
   }
 
   public async preflight(): Promise<IListMigrationPlan> {
+    try {
+      return await this.runPreflight();
+    } catch (error) {
+      throw new Error(
+        `Could not preflight source list "${this.request.sourceListTitle}" at ${this.request.sourceSiteUrl} ` +
+        `and destination list "${this.request.targetListTitle}" at ${this.request.targetSiteUrl}. ` +
+        getReadableErrorMessage(error)
+      );
+    }
+  }
+
+  private async runPreflight(): Promise<IListMigrationPlan> {
     const source = this.source.web.lists.getByTitle(this.request.sourceListTitle);
     const target = this.target.web.lists.getByTitle(this.request.targetListTitle);
     await this.checkPermissions();
@@ -249,8 +290,7 @@ export default class ListMigrationService {
 
     const key = this.getCheckpointKey(sourceInfo.Id, targetInfo.Id);
     const probeKey = `${key}.probe`;
-    localStorage.setItem(probeKey, '1');
-    localStorage.removeItem(probeKey);
+    this.checkLocalStorage(probeKey);
 
     const checkpoint = this.readCheckpoint(key);
     let checkpointChanged = false;
@@ -262,9 +302,16 @@ export default class ListMigrationService {
     }
     if (checkpointChanged) {
       if (Object.keys(checkpoint).length) {
-        localStorage.setItem(key, JSON.stringify(checkpoint));
+        this.saveCheckpoint(key, checkpoint);
       } else {
-        localStorage.removeItem(key);
+        try {
+          localStorage.removeItem(key);
+        } catch (error) {
+          throw new Error(
+            'Could not update the browser migration checkpoint after reconciling deleted target records. ' +
+            getReadableErrorMessage(error)
+          );
+        }
       }
     }
 
@@ -279,21 +326,99 @@ export default class ListMigrationService {
   }
 
   private readCheckpoint(key: string): IMigrationCheckpoint {
-    const checkpoint: IMigrationCheckpoint = JSON.parse(localStorage.getItem(key) || '{}');
+    let checkpoint: IMigrationCheckpoint;
+    try {
+      checkpoint = JSON.parse(localStorage.getItem(key) || '{}') as IMigrationCheckpoint;
+    } catch (error) {
+      throw new Error(
+        `The saved migration checkpoint is unreadable. Do not delete it before reconciling destination records. ` +
+        getReadableErrorMessage(error)
+      );
+    }
     if (!checkpoint || typeof checkpoint !== 'object' || Array.isArray(checkpoint) ||
         Object.keys(checkpoint).some(sourceId => !/^\d+$/.test(sourceId) ||
           !checkpoint[sourceId] || !Number.isInteger(checkpoint[sourceId].targetId) ||
           checkpoint[sourceId].targetId <= 0 || typeof checkpoint[sourceId].completed !== 'boolean')) {
-      throw new Error('Invalid migration checkpoint. Reconcile target items before resetting it.');
+      throw new Error(
+        'The saved migration checkpoint has an invalid format. Reconcile destination records before resetting it.'
+      );
     }
     return checkpoint;
+  }
+
+  private checkLocalStorage(probeKey: string): void {
+    try {
+      localStorage.setItem(probeKey, '1');
+      localStorage.removeItem(probeKey);
+    } catch (error) {
+      throw new Error(
+        'This browser cannot access local storage, which is required for migration recovery. ' +
+        'Enable browser storage for this SharePoint site and retry. ' +
+        getReadableErrorMessage(error)
+      );
+    }
+  }
+
+  private saveCheckpoint(key: string, checkpoint: IMigrationCheckpoint): void {
+    try {
+      localStorage.setItem(key, JSON.stringify(checkpoint));
+    } catch (error) {
+      throw new Error(
+        'Could not save migration progress in this browser. Check that local storage is enabled and has free space. ' +
+        'The destination may already contain the current item; reconcile it before retrying. ' +
+        getReadableErrorMessage(error)
+      );
+    }
+  }
+
+  private resolvePrincipal(site: typeof this.source, siteKey: string, id: number): Promise<IResolvedPrincipal> {
+    const cacheKey = `${siteKey}:${id}`;
+    if (!this.principalCache[cacheKey]) {
+      this.principalCache[cacheKey] = (async (): Promise<IResolvedPrincipal> => {
+        try {
+          const user = await site.web.siteUsers.getById(id).select('Email', 'LoginName', 'Title', 'PrincipalType')();
+          const isGroup = isGroupPrincipal(user.PrincipalType);
+          const identity = isGroup
+            ? user.Title || user.LoginName || user.Email
+            : user.Email || user.LoginName || user.Title;
+          if (!identity) {
+            throw new Error(`SharePoint principal ID ${id} has no usable identity.`);
+          }
+          return { kind: isGroup ? 'group' : 'user', identity, title: user.Title || identity };
+        } catch (userError) {
+          if (!isNotFoundError(userError)) {
+            throw userError;
+          }
+        }
+        // SharePoint groups are not returned by siteUsers, so fall back to siteGroups.
+        try {
+          const group = await site.web.siteGroups.getById(id).select('Title', 'LoginName')();
+          const title = group.Title || group.LoginName;
+          if (!title) {
+            throw new Error(`SharePoint group ID ${id} has no title.`);
+          }
+          return { kind: 'group', identity: title, title };
+        } catch (groupError) {
+          if (isNotFoundError(groupError)) {
+            throw new PrincipalNotFoundError(
+              `No user or SharePoint group with ID ${id} exists in the ${siteKey} site. ` +
+              getReadableErrorMessage(groupError)
+            );
+          }
+          throw groupError;
+        }
+      })();
+    }
+    return this.principalCache[cacheKey];
   }
 
   private async getComparableValue(
     value: unknown,
     field: IListMigrationField,
     site: typeof this.source,
-    siteKey: string
+    siteKey: string,
+    itemId: number,
+    groupWarnings: Set<string>
   ): Promise<string> {
     if (field.TypeAsString === 'User' || field.TypeAsString === 'UserMulti') {
       const isMulti = field.TypeAsString === 'UserMulti';
@@ -305,13 +430,25 @@ export default class ListMigrationService {
         if (!Number.isInteger(id) || id <= 0) {
           throw new Error(`Invalid person value while checking ${field.InternalName}.`);
         }
-        const cacheKey = `${siteKey}:${id}`;
-        if (!this.userIdentityCache[cacheKey]) {
-          this.userIdentityCache[cacheKey] = site.web.siteUsers.getById(id)
-            .select('Email', 'LoginName')()
-            .then(person => (person.Email || person.LoginName).toLowerCase());
+        try {
+          const principal = await this.resolvePrincipal(site, siteKey, id);
+          identities.push(principal.kind === 'group'
+            ? `group:${principal.title.toLowerCase()}`
+            : `user:${principal.identity.toLowerCase()}`);
+        } catch (error) {
+          if (error instanceof PrincipalNotFoundError && fieldAllowsGroups(field)) {
+            groupWarnings.add(
+              `Could not resolve user/group ID ${id} in ${siteKey} item ${itemId}, field "${field.InternalName}"; ` +
+              'this value was excluded from comparison and needs a separate check.'
+            );
+            continue;
+          }
+          throw new Error(
+            `Unable to resolve user/group ID ${id} in the ${siteKey} site for field "${field.InternalName}". ` +
+            'Confirm the account or group exists and is available in that SharePoint site. ' +
+            `SharePoint detail: ${getReadableErrorMessage(error)}`
+          );
         }
-        identities.push(await this.userIdentityCache[cacheKey]);
       }
       return JSON.stringify(isMulti ? identities.sort() : identities);
     }
@@ -327,6 +464,18 @@ export default class ListMigrationService {
   }
 
   public async verify(plan: IListMigrationPlan): Promise<IListVerificationReport> {
+    try {
+      return await this.runVerification(plan);
+    } catch (error) {
+      throw new Error(
+        `Could not compare source list "${this.request.sourceListTitle}" at ${this.request.sourceSiteUrl} ` +
+        `with destination list "${this.request.targetListTitle}" at ${this.request.targetSiteUrl}. ` +
+        getReadableErrorMessage(error)
+      );
+    }
+  }
+
+  private async runVerification(plan: IListMigrationPlan): Promise<IListVerificationReport> {
     const source = this.source.web.lists.getByTitle(this.request.sourceListTitle);
     const target = this.target.web.lists.getByTitle(this.request.targetListTitle);
     const [sourceInfo, targetInfo] = await Promise.all([
@@ -351,7 +500,8 @@ export default class ListMigrationService {
     const getSignature = async (
       item: IListMigrationItem,
       site: typeof this.source,
-      siteKey: string
+      siteKey: string,
+      groupWarnings: Set<string>
     ): Promise<string> => {
       const values: Record<string, string> = {};
       for (const field of plan.fields) {
@@ -359,36 +509,52 @@ export default class ListMigrationService {
           ? `${field.InternalName}Id`
           : field.InternalName;
         if (item[name] === undefined) {
-          throw new Error(`Could not read ${field.InternalName} from list item ${item.Id}.`);
+          throw new Error(
+            `Field "${field.InternalName}" was not returned for item ID ${item.Id} ` +
+            `from the ${siteKey} list "${siteKey === 'source' ? this.request.sourceListTitle : this.request.targetListTitle}".`
+          );
         }
-        values[field.InternalName] = await this.getComparableValue(item[name], field, site, siteKey);
+        try {
+          values[field.InternalName] = await this.getComparableValue(
+            item[name], field, site, siteKey, item.Id, groupWarnings
+          );
+        } catch (error) {
+          throw new Error(
+            `Could not compare field "${field.InternalName}" for item ID ${item.Id} ` +
+            `in the ${siteKey} list "${siteKey === 'source' ? this.request.sourceListTitle : this.request.targetListTitle}". ` +
+            getReadableErrorMessage(error)
+          );
+        }
       }
       return JSON.stringify(values);
     };
 
+    const groupWarnings = new Set<string>();
     const [sourceRecords, targetRecords] = await Promise.all([
       Promise.all(sourceItems.map(async item => ({
         Id: item.Id,
-        signature: await getSignature(item, this.source, 'source')
+        signature: await getSignature(item, this.source, 'source', groupWarnings)
       }))),
       Promise.all(targetItems.map(async item => ({
         Id: item.Id,
-        signature: await getSignature(item, this.target, 'target')
+        signature: await getSignature(item, this.target, 'target', groupWarnings)
       })))
     ]);
     return {
       sourceRecords: sourceRecords.length,
       targetRecords: targetRecords.length,
-      ...compareRecords(sourceRecords, targetRecords)
+      ...compareRecords(sourceRecords, targetRecords),
+      groupWarnings: Array.from(groupWarnings)
     };
   }
 
-  public async migrate(plan: IListMigrationPlan, progress: (message: string) => void): Promise<void> {
+  public async migrate(plan: IListMigrationPlan, progress: (message: string) => void): Promise<string[]> {
     if (this.running) {
       throw new Error('A migration is already running.');
     }
     this.running = true;
     let activeId = 0;
+    const groupWarnings = new Set<string>();
     try {
       await this.checkPermissions();
       const source = this.source.web.lists.getByTitle(this.request.sourceListTitle);
@@ -426,13 +592,49 @@ export default class ListMigrationService {
             const resolved: number[] = [];
             for (const userId of ids) {
               if (!this.userIds[String(userId)]) {
-                const user = await this.source.web.siteUsers.getById(userId).select('Email', 'LoginName')();
-                const targetUser = await this.target.web.ensureUser(user.Email || user.LoginName);
-                this.userIds[String(userId)] = targetUser.Id;
+                let principal: IResolvedPrincipal;
+                try {
+                  principal = await this.resolvePrincipal(this.source, 'source', userId);
+                } catch (error) {
+                  if (error instanceof PrincipalNotFoundError && fieldAllowsGroups(field)) {
+                    groupWarnings.add(
+                      `Could not resolve user/group ID ${userId} for source item ${item.Id}, field ` +
+                      `"${field.InternalName}"; the value was left empty and needs a separate check.`
+                    );
+                    continue;
+                  }
+                  throw new Error(
+                    `Could not map person field "${field.InternalName}" for source item ${item.Id} ` +
+                    `(source user/group ID ${userId}). Confirm the source account exists and the destination site can resolve it. ` +
+                    getReadableErrorMessage(error)
+                  );
+                }
+                try {
+                  const targetPrincipal = principal.kind === 'group'
+                    ? await this.target.web.siteGroups.getByName(principal.title).select('Id')()
+                    : await this.target.web.ensureUser(principal.identity);
+                  this.userIds[String(userId)] = targetPrincipal.Id;
+                } catch (error) {
+                  if (principal.kind === 'group') {
+                    groupWarnings.add(
+                      `Could not resolve group "${principal.title}" in the destination site for source item ${item.Id}, ` +
+                      `field "${field.InternalName}" (source ID ${userId}); the value was left empty and ` +
+                      'needs a separate check.'
+                    );
+                    continue;
+                  }
+                  throw new Error(
+                    `Could not map person field "${field.InternalName}" for source item ${item.Id} ` +
+                    `(source user ID ${userId}, "${principal.identity}"). The destination site could not resolve this account. ` +
+                    getReadableErrorMessage(error)
+                  );
+                }
               }
               resolved.push(this.userIds[String(userId)]);
             }
-            values[`${field.InternalName}Id`] = multi ? resolved : resolved[0] || null;
+            if (resolved.length || !fieldAllowsGroups(field)) {
+              values[`${field.InternalName}Id`] = multi ? resolved : resolved[0] || null;
+            }
           }
 
           const created = await target.items.add(values);
@@ -441,7 +643,7 @@ export default class ListMigrationService {
           }
           entry = { targetId: created.Id, completed: false };
           checkpoint[String(item.Id)] = entry;
-          localStorage.setItem(plan.key, JSON.stringify(checkpoint));
+          this.saveCheckpoint(plan.key, checkpoint);
         }
 
         const targetItem = target.items.getById(entry.targetId);
@@ -459,14 +661,18 @@ export default class ListMigrationService {
         }
 
         entry.completed = true;
-        localStorage.setItem(plan.key, JSON.stringify(checkpoint));
+        this.saveCheckpoint(plan.key, checkpoint);
         progress(`Source item ${item.Id} copied to target item ${entry.targetId}.`);
       }
       progress(`Migration completed for ${plan.items.length} source items. Verify target values and attachments.`);
+      return Array.from(groupWarnings);
     } catch (error) {
-      throw new Error(`Migration stopped${activeId ? ` at source item ${activeId}` : ''}: ${
-        error instanceof Error ? error.message : String(error)
-      }`);
+      throw new Error(
+        `Migration stopped${activeId ? ` at source item ${activeId}` : ''} for destination list ` +
+        `"${this.request.targetListTitle}" at ${this.request.targetSiteUrl}: ${
+        getReadableErrorMessage(error)
+        }`
+      );
     } finally {
       this.running = false;
     }
