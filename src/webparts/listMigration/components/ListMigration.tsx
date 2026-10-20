@@ -28,6 +28,7 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
   const [plan, setPlan] = React.useState<IListMigrationPlan>();
   const [busy, setBusy] = React.useState(false);
   const [confirmed, setConfirmed] = React.useState(false);
+  const [migrationSucceeded, setMigrationSucceeded] = React.useState(false);
   const [error, setError] = React.useState('');
   const [messages, setMessages] = React.useState<string[]>([]);
   const [pendingOperation, setPendingOperation] = React.useState<'preflight' | 'migrate'>();
@@ -39,6 +40,7 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
   const resetPlan = (): void => {
     setPlan(undefined);
     setConfirmed(false);
+    setMigrationSucceeded(false);
     setMessages([]);
   };
 
@@ -78,11 +80,13 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
     if (!plan || !confirmed || inFlight.current) return;
     inFlight.current = true;
     setBusy(true);
+    setMigrationSucceeded(false);
     setError('');
     try {
       const service = new ListMigrationService(props.context, getRequest());
       await service.migrate(plan, message => setMessages(previous => [...previous.slice(-29), message]));
       setConfirmed(false);
+      setMigrationSucceeded(true);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
     } finally {
@@ -252,6 +256,26 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
           <DefaultButton
             text="Cancel"
             onClick={() => setPendingOperation(undefined)}
+          />
+        </DialogFooter>
+      </Dialog>
+      <Dialog
+        hidden={!migrationSucceeded}
+        onDismiss={() => setMigrationSucceeded(false)}
+        dialogContentProps={{
+          type: DialogType.normal,
+          title: 'Migration successful',
+          subText: `All ${plan?.items.length || 0} records and their attachments have been copied successfully.`
+        }}
+        modalProps={{ isBlocking: true }}
+      >
+        <MessageBar messageBarType={MessageBarType.success} isMultiline>
+          The migration completed successfully. Please verify the records in the destination list.
+        </MessageBar>
+        <DialogFooter>
+          <PrimaryButton
+            text="Done"
+            onClick={() => setMigrationSucceeded(false)}
           />
         </DialogFooter>
       </Dialog>
