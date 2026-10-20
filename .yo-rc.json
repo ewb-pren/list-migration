@@ -1,0 +1,23 @@
+{
+  "@microsoft/generator-sharepoint": {
+    "whichFolder": "subdir",
+    "solutionName": "list-migration",
+    "environment": "spo",
+    "packageManager": "pnpm",
+    "skipFeatureDeployment": true,
+    "useGulp": false,
+    "componentType": "webpart",
+    "template": "react",
+    "componentName": "ListMigration",
+    "componentDescription": "Copy SharePoint list templates between sites",
+    "plusBeta": false,
+    "isCreatingSolution": true,
+    "nodeVersion": "22.14.0",
+    "sdksVersions": {},
+    "version": "1.22.2",
+    "libraryName": "list-migration",
+    "libraryId": "051b6ad0-a249-4701-956c-b53577f021a3",
+    "solutionShortDescription": "list-migration description",
+    "isDomainIsolated": false
+  }
+}
