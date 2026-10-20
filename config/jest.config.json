@@ -1,0 +1,11 @@
+{
+  "extends": "@microsoft/spfx-web-build-rig/profiles/default/config/jest.config.json",
+  "roots": [
+    "<rootDir>/lib-commonjs",
+    "<rootDir>/tests"
+  ],
+  "testMatch": [
+    "<rootDir>/lib-commonjs/**/*.test.js",
+    "<rootDir>/tests/**/*.test.js"
+  ]
+}

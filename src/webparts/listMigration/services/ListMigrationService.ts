@@ -1,6 +1,7 @@
 import { spfi, SPFx } from '@pnp/sp';
 import { WebPartContext } from '@microsoft/sp-webpart-base';
 import { PermissionKind } from '@pnp/sp/security';
+import { compareRecords } from './ListComparison';
 import '@pnp/sp/webs';
 import '@pnp/sp/lists';
 import '@pnp/sp/items';
@@ -365,58 +366,21 @@ export default class ListMigrationService {
       return JSON.stringify(values);
     };
 
-    const targetBuckets = new Map<string, IListMigrationItem[]>();
-    for (const targetItem of targetItems) {
-      const signature = await getSignature(targetItem, this.target, 'target');
-      const bucket = targetBuckets.get(signature);
-      if (bucket) {
-        bucket.push(targetItem);
-      } else {
-        targetBuckets.set(signature, [targetItem]);
-      }
-    }
-
-    const unmatchedSource: IListMigrationItem[] = [];
-    const report: IListVerificationReport = {
-      sourceRecords: sourceItems.length,
-      targetRecords: targetItems.length,
-      matchingRecords: 0,
-      sourceOnlyRecords: 0,
-      targetOnlyRecords: 0,
-      differences: []
+    const [sourceRecords, targetRecords] = await Promise.all([
+      Promise.all(sourceItems.map(async item => ({
+        Id: item.Id,
+        signature: await getSignature(item, this.source, 'source')
+      }))),
+      Promise.all(targetItems.map(async item => ({
+        Id: item.Id,
+        signature: await getSignature(item, this.target, 'target')
+      })))
+    ]);
+    return {
+      sourceRecords: sourceRecords.length,
+      targetRecords: targetRecords.length,
+      ...compareRecords(sourceRecords, targetRecords)
     };
-    for (const sourceItem of sourceItems) {
-      const signature = await getSignature(sourceItem, this.source, 'source');
-      const bucket = targetBuckets.get(signature);
-      if (bucket && bucket.length > 0) {
-        bucket.shift();
-        report.matchingRecords++;
-      } else {
-        unmatchedSource.push(sourceItem);
-      }
-    }
-
-    const unmatchedTarget = Array.from(targetBuckets.values()).reduce(
-      (items, bucket) => items.concat(bucket),
-      [] as IListMigrationItem[]
-    );
-    report.sourceOnlyRecords = unmatchedSource.length;
-    report.targetOnlyRecords = unmatchedTarget.length;
-    for (const item of unmatchedSource) {
-      report.differences.push({
-        side: 'Source',
-        itemId: item.Id,
-        reason: 'No destination record with the same migrated field values.'
-      });
-    }
-    for (const item of unmatchedTarget) {
-      report.differences.push({
-        side: 'Target',
-        itemId: item.Id,
-        reason: 'No source record with the same migrated field values.'
-      });
-    }
-    return report;
   }
 
   public async migrate(plan: IListMigrationPlan, progress: (message: string) => void): Promise<void> {
