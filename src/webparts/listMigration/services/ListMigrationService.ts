@@ -42,6 +42,24 @@ export interface IListMigrationPlan {
   targetCount: number;
 }
 
+export interface IListVerificationDifference {
+  sourceId: number;
+  targetId: number;
+  field: string;
+  reason: string;
+}
+
+export interface IListVerificationReport {
+  matchedRecords: number;
+  matchingRecords: number;
+  differingRecords: number;
+  missingMappings: number;
+  missingSourceRecords: number;
+  missingTargetRecords: number;
+  untrackedTargetRecords: number;
+  differences: IListVerificationDifference[];
+}
+
 interface IMigrationCheckpointEntry {
   targetId: number;
   completed: boolean;
@@ -137,6 +155,24 @@ function getCopyValues(item: IListMigrationItem, fields: IListMigrationField[]):
     values[field.InternalName] = item[field.InternalName];
   }
   return values;
+}
+
+function normalizeValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return JSON.stringify(value.map(normalizeValue).sort());
+  }
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const normalized: Record<string, string> = {};
+    for (const key of Object.keys(record).sort()) {
+      normalized[key] = normalizeValue(record[key]);
+    }
+    return JSON.stringify(normalized);
+  }
+  return JSON.stringify(value);
 }
 
 export default class ListMigrationService {
@@ -252,6 +288,147 @@ export default class ListMigrationService {
       throw new Error('Invalid migration checkpoint. Reconcile target items before resetting it.');
     }
     return checkpoint;
+  }
+
+  private async getComparableValue(
+    value: unknown,
+    field: IListMigrationField,
+    site: typeof this.source
+  ): Promise<string> {
+    if (field.TypeAsString === 'User' || field.TypeAsString === 'UserMulti') {
+      const isMulti = field.TypeAsString === 'UserMulti';
+      const ids = value === null || value === undefined ? [] : isMulti
+        ? Array.isArray(value) ? value as number[] : [value as number]
+        : [value as number];
+      const identities: string[] = [];
+      for (const id of ids) {
+        if (!Number.isInteger(id) || id <= 0) {
+          throw new Error(`Invalid person value while checking ${field.InternalName}.`);
+        }
+        const person = await site.web.siteUsers.getById(id).select('Email', 'LoginName')();
+        identities.push((person.Email || person.LoginName).toLowerCase());
+      }
+      return JSON.stringify(isMulti ? identities.sort() : identities);
+    }
+
+    if (field.TypeAsString === 'DateTime' && value !== null && value !== undefined) {
+      const date = new Date(value as string | number);
+      if (!Number.isFinite(date.getTime())) {
+        throw new Error(`Invalid date value while checking ${field.InternalName}.`);
+      }
+      return date.toISOString();
+    }
+    return normalizeValue(value);
+  }
+
+  public async verify(plan: IListMigrationPlan): Promise<IListVerificationReport> {
+    const source = this.source.web.lists.getByTitle(this.request.sourceListTitle);
+    const target = this.target.web.lists.getByTitle(this.request.targetListTitle);
+    const [sourceInfo, targetInfo] = await Promise.all([
+      source.select('Id')(),
+      target.select('Id')()
+    ]);
+    if (sourceInfo.Id !== plan.sourceListId || targetInfo.Id !== plan.targetListId ||
+        plan.key !== this.getCheckpointKey(sourceInfo.Id, targetInfo.Id)) {
+      throw new Error('The verification plan no longer matches the selected lists. Run preflight again.');
+    }
+
+    const checkpoint = this.readCheckpoint(plan.key);
+    const sourceIds = new Set(plan.items.map(item => item.Id));
+    const targetItemIds = new Set<number>();
+    for await (const page of target.items.select('Id').orderBy('Id').top(500)) {
+      for (const item of page as Array<{ Id: number }>) {
+        targetItemIds.add(item.Id);
+      }
+    }
+
+    const report: IListVerificationReport = {
+      matchedRecords: 0,
+      matchingRecords: 0,
+      differingRecords: 0,
+      missingMappings: 0,
+      missingSourceRecords: Object.keys(checkpoint).filter(sourceId => !sourceIds.has(Number(sourceId))).length,
+      missingTargetRecords: 0,
+      untrackedTargetRecords: 0,
+      differences: []
+    };
+    const linkedTargetIds = new Set<number>();
+    const fieldsToSelect = plan.fields.map(field =>
+      field.TypeAsString.indexOf('User') === 0 ? `${field.InternalName}Id` : field.InternalName);
+
+    for (const plannedItem of plan.items) {
+      const entry = checkpoint[String(plannedItem.Id)];
+      if (!entry) {
+        report.missingMappings++;
+        continue;
+      }
+      linkedTargetIds.add(entry.targetId);
+      if (!targetItemIds.has(entry.targetId)) {
+        report.missingTargetRecords++;
+        report.differences.push({
+          sourceId: plannedItem.Id,
+          targetId: entry.targetId,
+          field: '(record)',
+          reason: 'Mapped target record does not exist.'
+        });
+        continue;
+      }
+
+      const sourceItem = await source.items.getById(plannedItem.Id)
+        .select('Id', 'Attachments', ...fieldsToSelect)() as IListMigrationItem;
+
+      const targetItem = await target.items.getById(entry.targetId)
+        .select('Id', 'Attachments', ...fieldsToSelect)() as IListMigrationItem;
+      report.matchedRecords++;
+      let recordMatches = true;
+      for (const field of plan.fields) {
+        const sourceName = field.TypeAsString.indexOf('User') === 0
+          ? `${field.InternalName}Id`
+          : field.InternalName;
+        const targetName = sourceName;
+        const [sourceValue, targetValue] = await Promise.all([
+          this.getComparableValue(sourceItem[sourceName], field, this.source),
+          this.getComparableValue(targetItem[targetName], field, this.target)
+        ]);
+        if (sourceValue !== targetValue) {
+          recordMatches = false;
+          report.differences.push({
+            sourceId: plannedItem.Id,
+            targetId: entry.targetId,
+            field: field.InternalName,
+            reason: 'Field values differ.'
+          });
+        }
+      }
+
+      if (sourceItem.Attachments || targetItem.Attachments) {
+        const [sourceAttachments, targetAttachments] = await Promise.all([
+          source.items.getById(plannedItem.Id).attachmentFiles(),
+          target.items.getById(entry.targetId).attachmentFiles()
+        ]);
+        const sourceNames = sourceAttachments.map(attachment => attachment.FileName).sort();
+        const targetNames = targetAttachments.map(attachment => attachment.FileName).sort();
+        if (normalizeValue(sourceNames) !== normalizeValue(targetNames)) {
+          recordMatches = false;
+          report.differences.push({
+            sourceId: plannedItem.Id,
+            targetId: entry.targetId,
+            field: 'Attachments',
+            reason: 'Attachment names differ.'
+          });
+        }
+      }
+
+      if (recordMatches) {
+        report.matchingRecords++;
+      } else {
+        report.differingRecords++;
+      }
+    }
+
+    report.untrackedTargetRecords = Array.from(targetItemIds)
+      .filter(targetId => !linkedTargetIds.has(targetId)).length;
+    return report;
   }
 
   public async migrate(plan: IListMigrationPlan, progress: (message: string) => void): Promise<void> {

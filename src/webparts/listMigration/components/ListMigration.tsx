@@ -15,6 +15,7 @@ import {
 import styles from './ListMigration.module.scss';
 import type { IListMigrationProps } from './IListMigrationProps';
 import ListMigrationService, {
+  IListVerificationReport,
   IListMigrationPlan,
   IListMigrationRequest
 } from '../services/ListMigrationService';
@@ -29,9 +30,10 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
   const [busy, setBusy] = React.useState(false);
   const [confirmed, setConfirmed] = React.useState(false);
   const [migrationSucceeded, setMigrationSucceeded] = React.useState(false);
+  const [verificationReport, setVerificationReport] = React.useState<IListVerificationReport>();
   const [error, setError] = React.useState('');
   const [messages, setMessages] = React.useState<string[]>([]);
-  const [pendingOperation, setPendingOperation] = React.useState<'preflight' | 'migrate'>();
+  const [pendingOperation, setPendingOperation] = React.useState<'preflight' | 'migrate' | 'verify'>();
   const inFlight = React.useRef(false);
   const releaseInFlight = (): void => {
     inFlight.current = false;
@@ -41,6 +43,7 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
     setPlan(undefined);
     setConfirmed(false);
     setMigrationSucceeded(false);
+    setVerificationReport(undefined);
     setMessages([]);
   };
 
@@ -81,6 +84,7 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
     inFlight.current = true;
     setBusy(true);
     setMigrationSucceeded(false);
+    setVerificationReport(undefined);
     setError('');
     try {
       const service = new ListMigrationService(props.context, getRequest());
@@ -95,15 +99,34 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
     }
   };
 
-  const requestOperation = async (operation: 'preflight' | 'migrate'): Promise<void> => {
+  const runVerification = async (): Promise<void> => {
+    if (!plan || inFlight.current) return;
+    inFlight.current = true;
+    setBusy(true);
+    setVerificationReport(undefined);
+    setError('');
+    try {
+      const service = new ListMigrationService(props.context, getRequest());
+      setVerificationReport(await service.verify(plan));
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      releaseInFlight();
+      setBusy(false);
+    }
+  };
+
+  const requestOperation = async (operation: 'preflight' | 'migrate' | 'verify'): Promise<void> => {
     if (isProductionRisk) {
       setPendingOperation(operation);
       return;
     }
     if (operation === 'preflight') {
       await runPreflight();
-    } else {
+    } else if (operation === 'migrate') {
       await runMigration();
+    } else {
+      await runVerification();
     }
   };
 
@@ -114,6 +137,8 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
       await runPreflight();
     } else if (operation === 'migrate') {
       await runMigration();
+    } else if (operation === 'verify') {
+      await runVerification();
     }
   };
 
@@ -195,6 +220,12 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
             disabled={busy || !plan || !confirmed || !plan.items.length}
             onClick={() => requestOperation('migrate')}
           />
+          <DefaultButton
+            text="Check consistency"
+            iconProps={{ iconName: 'Compare' }}
+            disabled={busy || !plan}
+            onClick={() => requestOperation('verify')}
+          />
           {busy && <Spinner label="Processing migration" />}
         </Stack>
 
@@ -226,6 +257,56 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
             label="I reviewed the field mapping, existing target data, and workflow warning."
             onChange={(_event, checked) => setConfirmed(Boolean(checked))}
           />
+        </>}
+
+        {verificationReport && <>
+          <h3>Consistency check</h3>
+          <MessageBar
+            messageBarType={
+              verificationReport.differingRecords === 0 &&
+              verificationReport.missingMappings === 0 &&
+              verificationReport.missingSourceRecords === 0 &&
+              verificationReport.missingTargetRecords === 0 &&
+              verificationReport.untrackedTargetRecords === 0
+                ? MessageBarType.success
+                : MessageBarType.warning
+            }
+            isMultiline
+          >
+            Checked {verificationReport.matchedRecords} mapped records:
+            {' '}{verificationReport.matchingRecords} match and {verificationReport.differingRecords} differ.
+            {' '}{verificationReport.missingMappings} source records have no migration mapping;
+            {' '}{verificationReport.missingSourceRecords} checkpoint records are no longer in the source list;
+            {' '}{verificationReport.missingTargetRecords} mapped target records are missing;
+            {' '}{verificationReport.untrackedTargetRecords} target records are not mapped to this source list.
+          </MessageBar>
+          {verificationReport.differences.length > 0 && (
+            <div className={styles.tableWrap}>
+              <table className={styles.fieldTable} aria-label="Consistency differences">
+                <thead>
+                  <tr>
+                    <th style={cellStyle}>Source ID</th>
+                    <th style={cellStyle}>Target ID</th>
+                    <th style={cellStyle}>Field</th>
+                    <th style={cellStyle}>Difference</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {verificationReport.differences.slice(0, 50).map((difference, index) => (
+                    <tr key={`${difference.sourceId}-${difference.targetId}-${difference.field}-${index}`}>
+                      <td style={cellStyle}>{difference.sourceId}</td>
+                      <td style={cellStyle}>{difference.targetId}</td>
+                      <td style={cellStyle}>{difference.field}</td>
+                      <td style={cellStyle}>{difference.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {verificationReport.differences.length > 50 && (
+                <p>Showing the first 50 of {verificationReport.differences.length} differences.</p>
+              )}
+            </div>
+          )}
         </>}
 
         <div className={styles.log} role="log" aria-live="polite">
