@@ -43,20 +43,17 @@ export interface IListMigrationPlan {
 }
 
 export interface IListVerificationDifference {
-  sourceId: number;
-  targetId: number;
-  field: string;
+  side: 'Source' | 'Target';
+  itemId: number;
   reason: string;
 }
 
 export interface IListVerificationReport {
-  matchedRecords: number;
+  sourceRecords: number;
+  targetRecords: number;
   matchingRecords: number;
-  differingRecords: number;
-  missingMappings: number;
-  missingSourceRecords: number;
-  missingTargetRecords: number;
-  untrackedTargetRecords: number;
+  sourceOnlyRecords: number;
+  targetOnlyRecords: number;
   differences: IListVerificationDifference[];
 }
 
@@ -179,6 +176,7 @@ export default class ListMigrationService {
   private source;
   private target;
   private userIds: Record<string, number> = {};
+  private readonly userIdentityCache: Record<string, Promise<string>> = {};
   private running = false;
   private readonly request: IListMigrationRequest;
 
@@ -293,7 +291,8 @@ export default class ListMigrationService {
   private async getComparableValue(
     value: unknown,
     field: IListMigrationField,
-    site: typeof this.source
+    site: typeof this.source,
+    siteKey: string
   ): Promise<string> {
     if (field.TypeAsString === 'User' || field.TypeAsString === 'UserMulti') {
       const isMulti = field.TypeAsString === 'UserMulti';
@@ -305,8 +304,13 @@ export default class ListMigrationService {
         if (!Number.isInteger(id) || id <= 0) {
           throw new Error(`Invalid person value while checking ${field.InternalName}.`);
         }
-        const person = await site.web.siteUsers.getById(id).select('Email', 'LoginName')();
-        identities.push((person.Email || person.LoginName).toLowerCase());
+        const cacheKey = `${siteKey}:${id}`;
+        if (!this.userIdentityCache[cacheKey]) {
+          this.userIdentityCache[cacheKey] = site.web.siteUsers.getById(id)
+            .select('Email', 'LoginName')()
+            .then(person => (person.Email || person.LoginName).toLowerCase());
+        }
+        identities.push(await this.userIdentityCache[cacheKey]);
       }
       return JSON.stringify(isMulti ? identities.sort() : identities);
     }
@@ -328,106 +332,90 @@ export default class ListMigrationService {
       source.select('Id')(),
       target.select('Id')()
     ]);
-    if (sourceInfo.Id !== plan.sourceListId || targetInfo.Id !== plan.targetListId ||
-        plan.key !== this.getCheckpointKey(sourceInfo.Id, targetInfo.Id)) {
+    if (sourceInfo.Id !== plan.sourceListId || targetInfo.Id !== plan.targetListId) {
       throw new Error('The verification plan no longer matches the selected lists. Run preflight again.');
     }
 
-    const checkpoint = this.readCheckpoint(plan.key);
-    const sourceIds = new Set(plan.items.map(item => item.Id));
-    const targetItemIds = new Set<number>();
-    for await (const page of target.items.select('Id').orderBy('Id').top(500)) {
-      for (const item of page as Array<{ Id: number }>) {
-        targetItemIds.add(item.Id);
-      }
-    }
-
-    const report: IListVerificationReport = {
-      matchedRecords: 0,
-      matchingRecords: 0,
-      differingRecords: 0,
-      missingMappings: 0,
-      missingSourceRecords: Object.keys(checkpoint).filter(sourceId => !sourceIds.has(Number(sourceId))).length,
-      missingTargetRecords: 0,
-      untrackedTargetRecords: 0,
-      differences: []
-    };
-    const linkedTargetIds = new Set<number>();
     const fieldsToSelect = plan.fields.map(field =>
       field.TypeAsString.indexOf('User') === 0 ? `${field.InternalName}Id` : field.InternalName);
+    const sourceItems: IListMigrationItem[] = [];
+    const targetItems: IListMigrationItem[] = [];
+    for await (const page of source.items.select('Id', ...fieldsToSelect).orderBy('Id').top(500)) {
+      sourceItems.push(...page as IListMigrationItem[]);
+    }
+    for await (const page of target.items.select('Id', ...fieldsToSelect).orderBy('Id').top(500)) {
+      targetItems.push(...page as IListMigrationItem[]);
+    }
 
-    for (const plannedItem of plan.items) {
-      const entry = checkpoint[String(plannedItem.Id)];
-      if (!entry) {
-        report.missingMappings++;
-        continue;
-      }
-      linkedTargetIds.add(entry.targetId);
-      if (!targetItemIds.has(entry.targetId)) {
-        report.missingTargetRecords++;
-        report.differences.push({
-          sourceId: plannedItem.Id,
-          targetId: entry.targetId,
-          field: '(record)',
-          reason: 'Mapped target record does not exist.'
-        });
-        continue;
-      }
-
-      const sourceItem = await source.items.getById(plannedItem.Id)
-        .select('Id', 'Attachments', ...fieldsToSelect)() as IListMigrationItem;
-
-      const targetItem = await target.items.getById(entry.targetId)
-        .select('Id', 'Attachments', ...fieldsToSelect)() as IListMigrationItem;
-      report.matchedRecords++;
-      let recordMatches = true;
+    const getSignature = async (
+      item: IListMigrationItem,
+      site: typeof this.source,
+      siteKey: string
+    ): Promise<string> => {
+      const values: Record<string, string> = {};
       for (const field of plan.fields) {
-        const sourceName = field.TypeAsString.indexOf('User') === 0
+        const name = field.TypeAsString.indexOf('User') === 0
           ? `${field.InternalName}Id`
           : field.InternalName;
-        const targetName = sourceName;
-        const [sourceValue, targetValue] = await Promise.all([
-          this.getComparableValue(sourceItem[sourceName], field, this.source),
-          this.getComparableValue(targetItem[targetName], field, this.target)
-        ]);
-        if (sourceValue !== targetValue) {
-          recordMatches = false;
-          report.differences.push({
-            sourceId: plannedItem.Id,
-            targetId: entry.targetId,
-            field: field.InternalName,
-            reason: 'Field values differ.'
-          });
+        if (item[name] === undefined) {
+          throw new Error(`Could not read ${field.InternalName} from list item ${item.Id}.`);
         }
+        values[field.InternalName] = await this.getComparableValue(item[name], field, site, siteKey);
       }
+      return JSON.stringify(values);
+    };
 
-      if (sourceItem.Attachments || targetItem.Attachments) {
-        const [sourceAttachments, targetAttachments] = await Promise.all([
-          source.items.getById(plannedItem.Id).attachmentFiles(),
-          target.items.getById(entry.targetId).attachmentFiles()
-        ]);
-        const sourceNames = sourceAttachments.map(attachment => attachment.FileName).sort();
-        const targetNames = targetAttachments.map(attachment => attachment.FileName).sort();
-        if (normalizeValue(sourceNames) !== normalizeValue(targetNames)) {
-          recordMatches = false;
-          report.differences.push({
-            sourceId: plannedItem.Id,
-            targetId: entry.targetId,
-            field: 'Attachments',
-            reason: 'Attachment names differ.'
-          });
-        }
-      }
-
-      if (recordMatches) {
-        report.matchingRecords++;
+    const targetBuckets = new Map<string, IListMigrationItem[]>();
+    for (const targetItem of targetItems) {
+      const signature = await getSignature(targetItem, this.target, 'target');
+      const bucket = targetBuckets.get(signature);
+      if (bucket) {
+        bucket.push(targetItem);
       } else {
-        report.differingRecords++;
+        targetBuckets.set(signature, [targetItem]);
       }
     }
 
-    report.untrackedTargetRecords = Array.from(targetItemIds)
-      .filter(targetId => !linkedTargetIds.has(targetId)).length;
+    const unmatchedSource: IListMigrationItem[] = [];
+    const report: IListVerificationReport = {
+      sourceRecords: sourceItems.length,
+      targetRecords: targetItems.length,
+      matchingRecords: 0,
+      sourceOnlyRecords: 0,
+      targetOnlyRecords: 0,
+      differences: []
+    };
+    for (const sourceItem of sourceItems) {
+      const signature = await getSignature(sourceItem, this.source, 'source');
+      const bucket = targetBuckets.get(signature);
+      if (bucket && bucket.length > 0) {
+        bucket.shift();
+        report.matchingRecords++;
+      } else {
+        unmatchedSource.push(sourceItem);
+      }
+    }
+
+    const unmatchedTarget = Array.from(targetBuckets.values()).reduce(
+      (items, bucket) => items.concat(bucket),
+      [] as IListMigrationItem[]
+    );
+    report.sourceOnlyRecords = unmatchedSource.length;
+    report.targetOnlyRecords = unmatchedTarget.length;
+    for (const item of unmatchedSource) {
+      report.differences.push({
+        side: 'Source',
+        itemId: item.Id,
+        reason: 'No destination record with the same migrated field values.'
+      });
+    }
+    for (const item of unmatchedTarget) {
+      report.differences.push({
+        side: 'Target',
+        itemId: item.Id,
+        reason: 'No source record with the same migrated field values.'
+      });
+    }
     return report;
   }
 

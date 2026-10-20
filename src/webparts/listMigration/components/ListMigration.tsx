@@ -259,56 +259,6 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
           />
         </>}
 
-        {verificationReport && <>
-          <h3>Consistency check</h3>
-          <MessageBar
-            messageBarType={
-              verificationReport.differingRecords === 0 &&
-              verificationReport.missingMappings === 0 &&
-              verificationReport.missingSourceRecords === 0 &&
-              verificationReport.missingTargetRecords === 0 &&
-              verificationReport.untrackedTargetRecords === 0
-                ? MessageBarType.success
-                : MessageBarType.warning
-            }
-            isMultiline
-          >
-            Checked {verificationReport.matchedRecords} mapped records:
-            {' '}{verificationReport.matchingRecords} match and {verificationReport.differingRecords} differ.
-            {' '}{verificationReport.missingMappings} source records have no migration mapping;
-            {' '}{verificationReport.missingSourceRecords} checkpoint records are no longer in the source list;
-            {' '}{verificationReport.missingTargetRecords} mapped target records are missing;
-            {' '}{verificationReport.untrackedTargetRecords} target records are not mapped to this source list.
-          </MessageBar>
-          {verificationReport.differences.length > 0 && (
-            <div className={styles.tableWrap}>
-              <table className={styles.fieldTable} aria-label="Consistency differences">
-                <thead>
-                  <tr>
-                    <th style={cellStyle}>Source ID</th>
-                    <th style={cellStyle}>Target ID</th>
-                    <th style={cellStyle}>Field</th>
-                    <th style={cellStyle}>Difference</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {verificationReport.differences.slice(0, 50).map((difference, index) => (
-                    <tr key={`${difference.sourceId}-${difference.targetId}-${difference.field}-${index}`}>
-                      <td style={cellStyle}>{difference.sourceId}</td>
-                      <td style={cellStyle}>{difference.targetId}</td>
-                      <td style={cellStyle}>{difference.field}</td>
-                      <td style={cellStyle}>{difference.reason}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {verificationReport.differences.length > 50 && (
-                <p>Showing the first 50 of {verificationReport.differences.length} differences.</p>
-              )}
-            </div>
-          )}
-        </>}
-
         <div className={styles.log} role="log" aria-live="polite">
           {messages.map((message, index) => <div key={`${index}-${message}`}>{message}</div>)}
         </div>
@@ -360,6 +310,65 @@ export default function ListMigration(props: IListMigrationProps): React.ReactEl
           />
         </DialogFooter>
       </Dialog>
+      {verificationReport && <Dialog
+        hidden={false}
+        onDismiss={() => setVerificationReport(undefined)}
+        dialogContentProps={{
+          type: DialogType.normal,
+          title: 'Consistency check results',
+          subText: `Compared ${verificationReport.sourceRecords} source records with ${
+            verificationReport.targetRecords
+          } destination records. ${verificationReport.matchingRecords} records match exactly.`
+        }}
+        modalProps={{
+          isBlocking: false,
+          styles: { main: { maxWidth: '90vw', width: 900 } }
+        }}
+      >
+        <MessageBar
+          messageBarType={
+            verificationReport.sourceOnlyRecords === 0 &&
+            verificationReport.targetOnlyRecords === 0
+              ? MessageBarType.success
+              : MessageBarType.warning
+          }
+          isMultiline
+        >
+          {verificationReport.sourceOnlyRecords === 0 && verificationReport.targetOnlyRecords === 0
+            ? 'Both lists contain the same values for all participating migration fields, including duplicate counts.'
+            : 'The lists differ in the participating migration field values.'}
+          {' '}Source-only records: {verificationReport.sourceOnlyRecords};
+          {' '}destination-only records: {verificationReport.targetOnlyRecords}.
+        </MessageBar>
+        {verificationReport.differences.length > 0 && (
+          <div className={styles.tableWrap}>
+            <table className={styles.fieldTable} aria-label="Consistency differences">
+              <thead>
+                <tr>
+                  <th style={cellStyle}>List</th>
+                  <th style={cellStyle}>Item ID</th>
+                  <th style={cellStyle}>Difference</th>
+                </tr>
+              </thead>
+              <tbody>
+                {verificationReport.differences.slice(0, 50).map((difference, index) => (
+                <tr key={`${difference.side}-${difference.itemId}-${index}`}>
+                  <td style={cellStyle}>{difference.side}</td>
+                  <td style={cellStyle}>{difference.itemId}</td>
+                  <td style={cellStyle}>{difference.reason}</td>
+                </tr>
+                ))}
+              </tbody>
+            </table>
+            {verificationReport.differences.length > 50 && (
+              <p>Showing the first 50 of {verificationReport.differences.length} differences.</p>
+            )}
+          </div>
+        )}
+        <DialogFooter>
+          <PrimaryButton text="Close" onClick={() => setVerificationReport(undefined)} />
+        </DialogFooter>
+      </Dialog>}
     </section>
   );
 }
