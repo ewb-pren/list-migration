@@ -22,12 +22,17 @@ export interface IListMigrationRequest {
 
 export interface IListMigrationField {
   InternalName: string;
+  EntityPropertyName: string;
   TypeAsString: string;
   Hidden: boolean;
   ReadOnlyField: boolean;
   Required?: boolean;
   DefaultValue?: string;
   SchemaXml: string;
+}
+
+export interface IListMigrationMappedField extends IListMigrationField {
+  TargetEntityPropertyName: string;
 }
 
 export interface IListMigrationItem {
@@ -40,7 +45,7 @@ export interface IListMigrationPlan {
   key: string;
   sourceListId: string;
   targetListId: string;
-  fields: IListMigrationField[];
+  fields: IListMigrationMappedField[];
   items: IListMigrationItem[];
   targetCount: number;
 }
@@ -91,9 +96,10 @@ function normalizeSiteUrl(value: string, currentSiteUrl: string): string {
   return url.toString().replace(/\/$/, '');
 }
 
-function getCopyFields(source: IListMigrationField[], target: IListMigrationField[]): IListMigrationField[] {
+function getCopyFields(source: IListMigrationField[], target: IListMigrationField[]): IListMigrationMappedField[] {
   const fields = source.filter(field => !field.Hidden && !field.ReadOnlyField &&
     excludedFields.indexOf(field.InternalName) < 0);
+  const mappedFields: IListMigrationMappedField[] = [];
 
   for (const field of fields) {
     const destination = target.find(candidate => candidate.InternalName === field.InternalName);
@@ -103,6 +109,10 @@ function getCopyFields(source: IListMigrationField[], target: IListMigrationFiel
     if (!destination || destination.ReadOnlyField || destination.TypeAsString !== field.TypeAsString) {
       throw new Error(`Missing or incompatible target field: ${field.InternalName}.`);
     }
+    if (!field.EntityPropertyName || !destination.EntityPropertyName) {
+      throw new Error(`Missing REST property name for source or target field: ${field.InternalName}.`);
+    }
+    mappedFields.push({ ...field, TargetEntityPropertyName: destination.EntityPropertyName });
     if (['Note', 'Choice', 'MultiChoice'].indexOf(field.TypeAsString) >= 0) {
       const sourceXml = new DOMParser().parseFromString(field.SchemaXml, 'application/xml');
       const targetXml = new DOMParser().parseFromString(destination.SchemaXml, 'application/xml');
@@ -141,19 +151,24 @@ function getCopyFields(source: IListMigrationField[], target: IListMigrationFiel
   if (!fields.length) {
     throw new Error('No writable business fields were found.');
   }
-  return fields;
+  return mappedFields;
 }
 
-function getCopyValues(item: IListMigrationItem, fields: IListMigrationField[]): Record<string, unknown> {
+function getItemPropertyName(field: IListMigrationMappedField, side: 'source' | 'target'): string {
+  const name = side === 'source' ? field.EntityPropertyName : field.TargetEntityPropertyName;
+  return field.TypeAsString.indexOf('User') === 0 ? `${name}Id` : name;
+}
+
+function getCopyValues(item: IListMigrationItem, fields: IListMigrationMappedField[]): Record<string, unknown> {
   const values: Record<string, unknown> = {};
   for (const field of fields) {
     if (field.TypeAsString === 'User' || field.TypeAsString === 'UserMulti') {
       continue;
     }
-    if (item[field.InternalName] === undefined) {
+    if (item[field.EntityPropertyName] === undefined) {
       throw new Error(`Source value was not returned: ${field.InternalName}.`);
     }
-    values[field.InternalName] = item[field.InternalName];
+    values[field.TargetEntityPropertyName] = item[field.EntityPropertyName];
   }
   return values;
 }
@@ -274,8 +289,7 @@ export default class ListMigrationService {
     const sourceFields = await source.fields() as IListMigrationField[];
     const targetFields = await target.fields() as IListMigrationField[];
     const fields = getCopyFields(sourceFields, targetFields);
-    const selectedFields = fields.map(field =>
-      field.TypeAsString.indexOf('User') === 0 ? `${field.InternalName}Id` : field.InternalName);
+    const selectedFields = fields.map(field => getItemPropertyName(field, 'source'));
     const items: IListMigrationItem[] = [];
     for await (const page of source.items.select('Id', 'Attachments', ...selectedFields).orderBy('Id').top(500)) {
       items.push(...page as IListMigrationItem[]);
@@ -486,28 +500,26 @@ export default class ListMigrationService {
       throw new Error('The verification plan no longer matches the selected lists. Run preflight again.');
     }
 
-    const fieldsToSelect = plan.fields.map(field =>
-      field.TypeAsString.indexOf('User') === 0 ? `${field.InternalName}Id` : field.InternalName);
+    const sourceFieldsToSelect = plan.fields.map(field => getItemPropertyName(field, 'source'));
+    const targetFieldsToSelect = plan.fields.map(field => getItemPropertyName(field, 'target'));
     const sourceItems: IListMigrationItem[] = [];
     const targetItems: IListMigrationItem[] = [];
-    for await (const page of source.items.select('Id', ...fieldsToSelect).orderBy('Id').top(500)) {
+    for await (const page of source.items.select('Id', ...sourceFieldsToSelect).orderBy('Id').top(500)) {
       sourceItems.push(...page as IListMigrationItem[]);
     }
-    for await (const page of target.items.select('Id', ...fieldsToSelect).orderBy('Id').top(500)) {
+    for await (const page of target.items.select('Id', ...targetFieldsToSelect).orderBy('Id').top(500)) {
       targetItems.push(...page as IListMigrationItem[]);
     }
 
     const getSignature = async (
       item: IListMigrationItem,
       site: typeof this.source,
-      siteKey: string,
+      siteKey: 'source' | 'target',
       groupWarnings: Set<string>
     ): Promise<string> => {
       const values: Record<string, string> = {};
       for (const field of plan.fields) {
-        const name = field.TypeAsString.indexOf('User') === 0
-          ? `${field.InternalName}Id`
-          : field.InternalName;
+        const name = getItemPropertyName(field, siteKey);
         if (item[name] === undefined) {
           throw new Error(
             `Field "${field.InternalName}" was not returned for item ID ${item.Id} ` +
@@ -583,7 +595,7 @@ export default class ListMigrationService {
         if (!entry) {
           const values = getCopyValues(item, plan.fields);
           for (const field of plan.fields.filter(candidate => candidate.TypeAsString.indexOf('User') === 0)) {
-            const raw = item[`${field.InternalName}Id`];
+            const raw = item[getItemPropertyName(field, 'source')];
             const multi = field.TypeAsString === 'UserMulti';
             const ids = raw === null ? [] : multi ? raw as number[] : [raw as number];
             if (!Array.isArray(ids) || ids.some(id => !Number.isInteger(id) || id <= 0)) {
@@ -633,7 +645,7 @@ export default class ListMigrationService {
               resolved.push(this.userIds[String(userId)]);
             }
             if (resolved.length || !fieldAllowsGroups(field)) {
-              values[`${field.InternalName}Id`] = multi ? resolved : resolved[0] || null;
+              values[getItemPropertyName(field, 'target')] = multi ? resolved : resolved[0] || null;
             }
           }
 

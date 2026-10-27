@@ -24,6 +24,7 @@ Consistency checking reads all current records in both lists and compares them a
 ## Limitations
 
 - The destination list must be created in advance. Its writable fields must have matching internal names and compatible types; required destination fields must be mapped or have defaults.
+- Fields are matched by `InternalName`, while item queries, writes, and consistency checks use each site's `EntityPropertyName`. This supports encoded fields such as `_x0076_t09` whose REST property is `OData__x0076_t09`, including person fields with an `Id` suffix.
 - This copies item values and attachments only. It does not copy list schema, views, content types, permissions, item IDs, version history, audit fields, or original link addresses.
 - New destination items may trigger Power Automate flows, alerts, or other list automations.
 - Review the destination and test a small migration before running a large or business-critical transfer.
